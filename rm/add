@@ -1,0 +1,8 @@
+mov rax, 10
+mov rbx, rip
+cmp rax, 0
+jer 12
+push rax
+sub rax, 1
+jmpa rbx
+push 69
