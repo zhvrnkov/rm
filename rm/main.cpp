@@ -128,15 +128,14 @@ struct Machine {
         *ip = 0;
         if (instructions.empty())
             return;
-        for (auto instr = instructions.rbegin(); instr != instructions.rend(); instr++) {
-            encode(*instr);
-        }
-        *rsp = *rbp = *ip;
-        (*ip) -= 1;
+        size_t programMemoryBase = 0;
+        for (const auto& instr : instructions)
+            encode(instr, &programMemoryBase);
+        *rsp = *rbp = programMemoryBase;
     }
     
     void execute() {
-        while (*ip != 0) {
+        while (*ip < *rbp) {
             step();
             dumpState();
             int i = 0;
@@ -144,16 +143,25 @@ struct Machine {
     }
     
     void step() {
-        if (*ip < 0)
+        if (*ip >= *rbp)
             throw Error::ERR_INVALID_IP;
-        execute(decodeNext());
+        size_t base = *ip;
+        const auto instruction = decodeNext(base);
+        bool isIPUpdated = false;
+        execute(instruction, [isIPUpdated, this](auto setter) mutable {
+            setter(*ip);
+            isIPUpdated = true;
+        });
+        if (isIPUpdated == false) {
+            (*ip) += 4; // if jmps => ip shouldn't be increased
+        }
     }
     
     void dumpState() {
         cout << "Stack:\n";
         Word stackBase = *rbp;
         Word stackEnd = *rsp;
-        for (int i = stackBase; i <= stackEnd; i++)
+        for (int i = stackBase; i < stackEnd; i++)
             cout << " " << (int)memory[i] << "\n";
         vector<pair<size_t, string>> regs = {
             { R::IP, "rip" },
@@ -178,23 +186,20 @@ struct Machine {
     
 private:
     
-    Instruction decodeNext() {
+    Instruction decodeNext(const size_t base) {
         Instruction instr;
-        for (int i = InstructionWordsCount - 1; i >= 0; i--) {
-            instr.words[i] = memory[*ip];
-            (*ip) -= 1;
+        for (int i = 0; i < InstructionWordsCount; i++) {
+            instr.words[i] = memory[base+i];
         }
         return instr;
     }
     
-    void encode(const Instruction &instr) {
-        for (int i = 0; i < InstructionWordsCount; i++) {
-            memory[*ip] = instr.words[i];
-            (*ip) += 1;
-        }
+    void encode(const Instruction &instr, size_t* base) {
+        for (int i = 0; i < InstructionWordsCount; i++)
+            memory[(*base)++] = instr.words[i];
     }
     
-    void execute(Instruction instr) {
+    void execute(Instruction instr, function<void(function<void(Word&)>)> ipSetter) {
         const auto& ins = instr.ins;
         switch (ins.operation) {
             case OP_MOV_R_I:
@@ -257,31 +262,17 @@ private:
 
                 
             case OP_PUSH_I:
-                execute({ OP_MOV_MR_I, R::SP, ins.operand1 });
-                execute({ OP_ADD_R_I, R::SP, 1 });
+                execute({ OP_MOV_MR_I, R::SP, ins.operand1 }, ipSetter);
+                execute({ OP_ADD_R_I, R::SP, 1 }, ipSetter);
                 break;
             case OP_PUSH_R:
-                execute({ OP_MOV_MR_R, R::SP, ins.operand1 });
-                execute({ OP_ADD_R_I, R::SP, 1 });
+                execute({ OP_MOV_MR_R, R::SP, ins.operand1 }, ipSetter);
+                execute({ OP_ADD_R_I, R::SP, 1 }, ipSetter);
                 break;
 
             case OP_POP_R:
-                execute({ OP_SUB_R_I, R::SP, 1 });
-                execute({ OP_MOV_R_MR, ins.operand1, R::SP });
-                break;
-                
-            case OP_JMPR_I:
-                (*ip) -= ins.operand1;
-                break;
-            case OP_JMPR_R:
-                (*ip) -= registers.at(ins.operand1);
-                break;
-                
-            case OP_JMPA_I:
-                (*ip) = ins.operand1;
-                break;
-            case OP_JMPA_R:
-                (*ip) = registers.at(ins.operand1);
+                execute({ OP_SUB_R_I, R::SP, 1 }, ipSetter);
+                execute({ OP_MOV_R_MR, ins.operand1, R::SP }, ipSetter);
                 break;
                 
             case OP_CMP_R_R: {
@@ -299,19 +290,49 @@ private:
                 break;
             }
                 
+            case OP_JMPR_I:
+                ipSetter([ins](Word& ip){
+                    ip += ins.operand1;
+                });
+                break;
+            case OP_JMPR_R:
+                ipSetter([ins, this](Word& ip){
+                    ip += registers.at(ins.operand1);
+                });
+                break;
+                
+            case OP_JMPA_I:
+                ipSetter([ins, this](Word& ip) {
+                    ip = ins.operand1;
+                });
+                break;
+            case OP_JMPA_R:
+                ipSetter([ins, this](Word& ip) {
+                    ip = registers.at(ins.operand1);
+                });
+                break;
+                
             case OP_JER_I:
-                if (flags->eq) (*ip) -= ins.operand1;
+                ipSetter([ins, this](Word& ip) {
+                    if (flags->eq) ip += ins.operand1;
+                });
                 break;
             case OP_JER_R:
-                if (flags->eq) (*ip) -= registers.at(ins.operand1);
+                ipSetter([ins, this](Word& ip) {
+                    if (flags->eq) ip += registers.at(ins.operand1);
+                });
                 break;
             case OP_JEA_I:
-                if (flags->eq) (*ip) = ins.operand1;
+                ipSetter([ins, this](Word& ip) {
+                    if (flags->eq) ip = ins.operand1;
+                });
                 break;
             case OP_JEA_R:
-                if (flags->eq) (*ip) = registers.at(ins.operand1);
+                ipSetter([ins, this](Word& ip) {
+                    if (flags->eq) ip = registers.at(ins.operand1);
+                });
                 break;
-
+                
         }
     }
     
